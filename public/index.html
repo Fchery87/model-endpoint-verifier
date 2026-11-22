@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Signal / Model Endpoint Verifier</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <main class="shell">
+      <header class="topbar">
+        <a class="brand" href="/"><span class="brand-mark">S</span><span>SIGNAL<span class="muted"> / VERIFY</span></span></a>
+        <div class="status"><span class="pulse"></span> LOCAL-FIRST TOOL</div>
+      </header>
+
+      <section class="hero">
+        <div class="eyebrow">MODEL INTEGRITY CHECK · 001</div>
+        <h1>Does the model<br /><em>match the claim?</em></h1>
+        <p class="hero-copy">Probe an AI provider’s endpoint, compare its advertised catalog with observed behavior, and get a report you can actually defend.</p>
+      </section>
+
+      <section class="workspace">
+        <form id="verify-form" class="panel config-panel">
+          <div class="panel-head"><span>01 / CONFIGURE PROBE</span><span class="mono">OPENAI-COMPATIBLE</span></div>
+          <label>API endpoint <span class="required">*</span>
+            <input id="endpoint" name="endpoint" type="url" placeholder="https://provider.example.com/v1" required />
+            <small>Base URL, /v1 URL, or a chat-completions URL</small>
+          </label>
+          <label>API key <span class="required">*</span>
+            <div class="secret-wrap"><input id="apiKey" name="apiKey" type="password" autocomplete="new-password" placeholder="sk-••••••••••••••••" required /><button type="button" id="toggle-key" aria-label="Show API key">SHOW</button></div>
+            <small>Used in memory for this run. Never included in the report.</small>
+          </label>
+          <label>Model to test <span class="optional">OPTIONAL</span>
+            <input id="model" name="model" type="text" placeholder="Leave blank to test the first 5 advertised models" />
+            <small>Enter a specific ID, or leave the field blank to sample the first 5 advertised models.</small>
+          </label>
+          <div class="probe-note"><span class="note-icon">i</span><span>Each model gets three identical baseline probes. The verifier compares routing, token usage, safe response headers, and capability behavior. It cannot cryptographically prove model identity.</span></div>
+          <button class="primary" type="submit" id="run-button"><span>RUN VERIFICATION</span><span class="arrow">↗</span></button>
+          <div id="form-error" class="form-error" hidden></div>
+        </form>
+
+        <section class="panel output-panel" aria-live="polite">
+          <div class="panel-head"><span>02 / EVIDENCE REPORT</span><div class="report-actions"><span id="report-time" class="mono">WAITING</span><button id="download-report" class="download" type="button" hidden>JSON ↓</button></div></div>
+          <div id="empty-state" class="empty-state">
+            <div class="target">◎</div>
+            <h2>Ready when you are.</h2>
+            <p>Connect an endpoint to reveal its catalog and run the first integrity probe.</p>
+            <div class="empty-lines"><span></span><span></span><span></span></div>
+          </div>
+          <div id="loading-state" class="loading-state" hidden>
+            <div class="loader"></div><h2>Running probes<span class="blink">…</span></h2><p id="loading-copy">Connecting to the model catalog</p>
+          </div>
+          <div id="report" hidden></div>
+        </section>
+      </section>
+
+      <footer><span>BLACK-BOX SIGNALS / TRANSPARENT UNCERTAINTY</span><span>v0.1 · LOCAL</span></footer>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

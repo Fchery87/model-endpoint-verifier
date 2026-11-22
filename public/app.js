@@ -46,6 +46,7 @@ function renderRun(run) {
       <div class="run-meta">
         <span><b>LATENCY</b> ${escapeHtml(run.latencyMs)} ms</span>
         <span><b>PROMPT TOKENS</b> ${escapeHtml(promptTokens)}</span>
+        <span><b>RETRIES</b> ${escapeHtml(run.retries || 0)}</span>
         <span><b>SYSTEM FINGERPRINT</b> ${run.systemFingerprint ? escapeHtml(run.systemFingerprint) : "n/a"}</span>
       </div>
       ${run.error ? `<div class="run-error">${escapeHtml(run.error)}</div>` : ""}

@@ -62,19 +62,27 @@ async function stopChildren() {
 let mockBase;
 let verifierBase;
 let stallVerifierBase;
+let budgetVerifierBase;
+let ssrfVerifierBase;
 
 try {
-  const [mockPort, verifierPort, stallVerifierPort] = await freePorts(3);
+  const [mockPort, verifierPort, stallVerifierPort, budgetVerifierPort, ssrfVerifierPort] = await freePorts(5);
   mockBase = `http://127.0.0.1:${mockPort}`;
   verifierBase = `http://127.0.0.1:${verifierPort}`;
   stallVerifierBase = `http://127.0.0.1:${stallVerifierPort}`;
+  budgetVerifierBase = `http://127.0.0.1:${budgetVerifierPort}`;
+  ssrfVerifierBase = `http://127.0.0.1:${ssrfVerifierPort}`;
 
   start("test/mock-provider.mjs", { MOCK_PORT: String(mockPort), MOCK_KEY: key });
   start("server.js", { PORT: String(verifierPort) });
   start("server.js", { PORT: String(stallVerifierPort), PROBE_TIMEOUT_MS: "800" });
+  start("server.js", { PORT: String(budgetVerifierPort), MAX_PROBE_TOKENS_PER_RUN: "100" });
+  start("server.js", { PORT: String(ssrfVerifierPort), HOSTED_SSRF_GUARD: "1" });
   await waitFor(`${mockBase}/v1/models`, { headers: { authorization: `Bearer ${key}` } });
   await waitFor(`${verifierBase}/`);
   await waitFor(`${stallVerifierBase}/`);
+  await waitFor(`${budgetVerifierBase}/`);
+  await waitFor(`${ssrfVerifierBase}/`);
 
   const page = await fetch(`${verifierBase}/`);
   assert.equal(page.status, 200);
@@ -133,6 +141,7 @@ try {
   assert.equal(checkFor(claude, "Usage consistency").dimension, "provenance");
   assert.equal(checkFor(claude, "Tool calling").status, "pass");
   assert.equal(checkFor(claude, "Structured output").status, "pass");
+  assert.equal(checkFor(claude, "Known answer").status, "pass");
 
   const substitutedReport = await verifyModel("deepseek-chat");
   const substituted = substitutedReport.selectedModels[0];
@@ -142,6 +151,9 @@ try {
   const provenance = checkFor(substituted, "Header provenance");
   assert.equal(provenance.status, "warn");
   assert.match(provenance.detail, /weak/);
+  const ownerProvenance = checkFor(substituted, "Catalog model provenance");
+  assert.equal(ownerProvenance.status, "warn");
+  assert.match(ownerProvenance.detail, /deepseek.*does not match|does not match.*gpt-4o-mini/);
 
   const flakyReport = await verifyModel("flaky-router");
   const flaky = flakyReport.selectedModels[0];
@@ -194,6 +206,8 @@ try {
   assert.equal(checkFor(retry, "Routing stability").status, "pass");
   assert.equal(retry.observations.runs.length, 3);
   assert.ok(retry.observations.runs.every((run) => !run.error));
+  assert.equal(retry.observations.runs[0].retries, 1, "The retried baseline run must record its retry");
+  assert.equal(retry.observations.runs[1].retries, 0);
 
   const streamReport = await verifyModel("claude-sonnet-4");
   assert.equal(checkFor(streamReport.selectedModels[0], "Streaming").status, "pass");
@@ -255,7 +269,29 @@ try {
   assert.equal(stall.observations.runs.length, 3);
   assert.ok(stall.observations.runs.every((run) => run.error === "The request timed out."));
 
-  const allReports = [report, substitutedReport, flakyReport, miniReport, silentReport, geminiReport, leakyReport, aliasReport, noJsonReport, retryReport, streamReport, dupReport, unstableReport, reasoningReport, versionedReport, defaultReport, stallReport];
+  const budgetResponse = await fetch(`${budgetVerifierBase}/api/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ endpoint: `${mockBase}/v1`, apiKey: key, model: "claude-sonnet-4" }),
+  });
+  assert.equal(budgetResponse.status, 200);
+  const budgetReport = await budgetResponse.json();
+  const budgeted = budgetReport.selectedModels[0];
+  assert.equal(checkFor(budgeted, "Known answer").status, "pass", "Cheap probes must still run inside a tight token budget");
+  assert.equal(checkFor(budgeted, "Structured output").status, "info");
+  assert.match(checkFor(budgeted, "Structured output").detail, /token budget/);
+  assert.equal(checkFor(budgeted, "Tool calling").status, "info");
+  assert.equal(checkFor(budgeted, "Streaming").status, "info");
+
+  const ssrfResponse = await fetch(`${ssrfVerifierBase}/api/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ endpoint: `${mockBase}/v1`, apiKey: key, model: "gpt-4o" }),
+  });
+  assert.equal(ssrfResponse.status, 400);
+  assert.match((await ssrfResponse.json()).error, /loopback/, "The hosted SSRF guard must reject loopback targets");
+
+  const allReports = [report, substitutedReport, flakyReport, miniReport, silentReport, geminiReport, leakyReport, aliasReport, noJsonReport, retryReport, streamReport, dupReport, unstableReport, reasoningReport, versionedReport, defaultReport, stallReport, budgetReport];
   for (const item of allReports) {
     const raw = JSON.stringify(item);
     assert.ok(!raw.includes(key), "API key must not appear in the report");

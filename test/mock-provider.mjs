@@ -172,7 +172,9 @@ createServer((req, res) => {
 
       const content = payload.response_format?.type === "json_object"
         ? JSON.stringify({ ok: true, verifier: "model-endpoint-verifier" })
-        : "Hello from the mock provider.";
+        : payload.messages?.some((message) => /17 plus 25/.test(String(message.content || "")))
+          ? "42"
+          : "Hello from the mock provider.";
       const includeMetadata = !(requested === "silent-metadata" && isBaseline);
       const responseBody = {
         id: "chatcmpl-mock",

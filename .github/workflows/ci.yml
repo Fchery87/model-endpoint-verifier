@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"
+
+env:
+  LIVE_ENDPOINT: ${{ secrets.LIVE_ENDPOINT }}
+  LIVE_API_KEY: ${{ secrets.LIVE_API_KEY }}
+  LIVE_MODEL: ${{ secrets.LIVE_MODEL }}
+  LIVE_LABEL: ${{ secrets.LIVE_LABEL }}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm test
+      - run: npm run test:fixtures
+
+  live-probe:
+    # Nightly only, and only when live-endpoint secrets are configured.
+    if: ${{ github.event_name == 'schedule' && env.LIVE_ENDPOINT != '' && env.LIVE_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node test/record-fixture.mjs
+      - run: node test/check-fixtures.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-fixture
+          path: test/fixtures/
+          retention-days: 90

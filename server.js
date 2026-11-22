@@ -3,6 +3,9 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { advertisedCapabilities, familyFromHeaders, familyFromModel } from "./lib/families.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
@@ -14,7 +17,10 @@ const MAX_PROBE_RETRIES = 1;
 const PROBE_BACKOFF_MS = 2000;
 const configuredTimeout = Number(process.env.PROBE_TIMEOUT_MS);
 const PROBE_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 18_000;
+const MAX_PROBE_TOKENS_PER_RUN = Number(process.env.MAX_PROBE_TOKENS_PER_RUN) || 20_000;
+const MAX_MODELS_PER_RUN = Number(process.env.MAX_MODELS_PER_RUN) || 5;
 const TEMPERATURE_REJECTION = /temperature|unsupported (parameter|value)|reasoning/i;
+const HOSTED_SSRF_GUARD = process.env.HOSTED_SSRF_GUARD === "1";
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -109,6 +115,47 @@ function endpointUrl(base, suffix) {
   return `${normalized}${suffix}`;
 }
 
+function isPrivateAddress(address) {
+  const ip = String(address || "").toLowerCase();
+  if (isIP(ip) === 4) {
+    const [a, b] = ip.split(".").map(Number);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a >= 224) return true;
+    return false;
+  }
+  if (isIP(ip) === 6) {
+    if (ip === "::1" || ip === "::") return true;
+    if (ip.startsWith("fe80") || ip.startsWith("fc") || ip.startsWith("fd")) return true;
+    if (ip.startsWith("::ffff:")) return isPrivateAddress(ip.slice(7));
+    return false;
+  }
+  return false;
+}
+
+async function assertNotPrivateTarget(url) {
+  if (!HOSTED_SSRF_GUARD) return;
+  const host = new URL(url).hostname.replace(/\.$/, "").toLowerCase();
+  if (isIP(host)) {
+    if (isPrivateAddress(host)) {
+      throw new Error("The endpoint is a private or loopback address, which is blocked for SSRF protection.");
+    }
+    return;
+  }
+  let records;
+  try {
+    records = await lookup(host, { all: true });
+  } catch {
+    throw new Error("Could not resolve the endpoint host.");
+  }
+  if (!records.length || records.some((entry) => isPrivateAddress(entry.address))) {
+    throw new Error("The endpoint resolves to a private or loopback address, which is blocked for SSRF protection.");
+  }
+}
+
 function headers(apiKey) {
   return {
     accept: "application/json",
@@ -133,7 +180,11 @@ async function fetchWithRetry(fetchFn, { retries = MAX_PROBE_RETRIES, backoffMs 
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      return await fetchFn();
+      const result = await fetchFn();
+      if (attempt > 0 && result && typeof result === "object" && !Array.isArray(result)) {
+        Object.defineProperty(result, "__retries", { value: attempt, enumerable: false, configurable: true });
+      }
+      return result;
     } catch (error) {
       lastError = error;
       if (attempt === retries) break;
@@ -222,53 +273,6 @@ async function responseJson(response) {
   return data;
 }
 
-function familyFromModel(modelId) {
-  const id = String(modelId || "").toLowerCase();
-  if (/(claude|anthropic|fable|mythos)/.test(id)) return "Anthropic";
-  if (/(gpt|o[134](?:-|$)|openai)/.test(id)) return "OpenAI";
-  if (/(gemini|gemma|google)/.test(id)) return "Google";
-  if (/deepseek/.test(id)) return "DeepSeek";
-  if (/(llama|\bmeta\b)/.test(id)) return "Meta";
-  if (/(mistral|mixtral|pixtral)/.test(id)) return "Mistral";
-  if (/(grok|xai)/.test(id)) return "xAI";
-  if (/(qwen|alibaba)/.test(id)) return "Alibaba";
-  if (/(command|cohere)/.test(id)) return "Cohere";
-  if (/(kimi|moonshot)/.test(id)) return "Moonshot";
-  if (/(glm|zhipu|z\.ai)/.test(id)) return "Z.ai";
-  if (/mimo/.test(id)) return "Xiaomi";
-  if (/minimax/.test(id)) return "MiniMax";
-  if (/(nemotron|nvidia)/.test(id)) return "NVIDIA";
-  return "Unknown family";
-}
-
-function familyFromHeaders(safeHeaders) {
-  const entries = typeof safeHeaders?.entries === "function"
-    ? [...safeHeaders.entries()]
-    : Object.entries(safeHeaders || {});
-  const names = entries.map(([name]) => String(name).toLowerCase());
-  const identityValues = entries
-    .filter(([name]) => ["server", "via", "x-served-by"].includes(String(name).toLowerCase()))
-    .map(([, value]) => String(value).toLowerCase());
-  const families = new Set();
-  if (names.some((name) => name.startsWith("anthropic-")) || identityValues.some((value) => value.includes("anthropic"))) {
-    families.add("Anthropic");
-  }
-  if (names.some((name) => name.startsWith("openai-")) || identityValues.some((value) => value.includes("openai"))) {
-    families.add("OpenAI");
-  }
-  if (names.includes("x-goog-request-id") || identityValues.some((value) => value.includes("google"))) {
-    families.add("Google");
-  }
-  if (identityValues.some((value) => value.includes("deepseek"))) {
-    families.add("DeepSeek");
-  }
-  if (identityValues.some((value) => value.includes("xai") || value.includes("grok"))) {
-    families.add("xAI");
-  }
-  if (families.size > 1) return "Mixed";
-  return families.values().next().value || "Unknown family";
-}
-
 function pickSafeHeaders(source) {
   const picked = {};
   for (const name of SAFE_HEADER_NAMES) {
@@ -277,16 +281,6 @@ function pickSafeHeaders(source) {
     if (text) picked[name] = text;
   }
   return picked;
-}
-
-function advertisedCapabilities(modelId) {
-  const id = String(modelId || "").toLowerCase();
-  const nonChat = /(embedding|moderation|rerank|whisper|tts|image|realtime|transcribe|speech|audio|live)/.test(id);
-  return {
-    likelyVision: /(vision|omni|multimodal|gemini|gemma|claude|gpt-4o|gpt-4\.1|gpt-5|gpt-6|o[134](?:-|$)|pixtral|llama-?4|qwen.*vl|deepseek.*(v4|vl))/.test(id),
-    likelyTools: !nonChat,
-    likelyChat: !nonChat,
-  };
 }
 
 function textFromCompletion(data) {
@@ -342,6 +336,29 @@ function errorDetail(error, secret) {
   return error?.name === "AbortError" ? "The request timed out." : redact(error?.message || "Verification failed.", secret);
 }
 
+function errorFingerprint(error) {
+  const message = String(error?.message || "").toLowerCase();
+  if (error?.name === "AbortError" || /timed out|timeout/.test(message)) return "timeout";
+  if (/unsupported parameter|unsupported value|not supported|unknown field|unrecognized|invalid parameter/.test(message)) return "unsupported_parameter";
+  if (/context length|context window|too many tokens|maximum context/.test(message)) return "context_length";
+  if (/rate limit|too many requests|429/.test(message)) return "rate_limit";
+  if (/quota|insufficient|exceeded your current quota/.test(message)) return "quota";
+  if (/invalid api key|unauthorized|401|403/.test(message)) return "auth";
+  if (/not found|unknown model|does not exist|404/.test(message)) return "model_not_found";
+  if (/http 5|internal server error|bad gateway|service unavailable|502|503|504/.test(message)) return "server_error";
+  return "unknown";
+}
+
+function digitsOf(text) {
+  return (String(text || "").match(/-?\d+/g) || []).map((value) => Number(value));
+}
+
+function firstUsefulNumber(text) {
+  const values = digitsOf(text);
+  const nonZero = values.find((value) => value !== 0);
+  return nonZero ?? values[0] ?? null;
+}
+
 function tokenCount(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -391,6 +408,7 @@ async function runBaselineProbes({ base, apiKey, modelId }) {
         usage: usageFrom(data),
         systemFingerprint: typeof data?.system_fingerprint === "string" ? data.system_fingerprint : null,
         headers: safeHeaders,
+        retries: data?.__retries || 0,
       });
       if (!firstCompletion) firstCompletion = data;
     } catch (error) {
@@ -516,10 +534,10 @@ function assessHeaderSignals(claimedFamily, headerFamily) {
   return info("provenance", "Header provenance", "Header provenance is inconclusive because the claimed family or the header family is unknown.");
 }
 
-async function runModelVerification({ base, apiKey, modelId, advertisedIds = [], catalogEntry, catalogChecks = [] }) {
+async function runModelVerification({ base, apiKey, modelId, advertisedIds = [], catalogEntry, catalogChecks = [], tokenBudget = MAX_PROBE_TOKENS_PER_RUN }) {
   const startedAt = new Date().toISOString();
   const claimedFamily = familyFromModel(modelId);
-  const expected = advertisedCapabilities(modelId);
+  const expected = advertisedCapabilities(modelId, catalogEntry);
   const checks = [];
 
   checks.push(advertisedIds.includes(modelId)
@@ -564,6 +582,12 @@ async function runModelVerification({ base, apiKey, modelId, advertisedIds = [],
 
   checks.push(assessRoutingStability(runs));
 
+  const returnedModel = firstCompletion?.model ? String(firstCompletion.model) : "";
+  const returnedFamily = familyFromModel(returnedModel);
+  if (ownedBy && returnedModel && ownerFamily !== "Unknown family" && returnedFamily !== "Unknown family" && ownerFamily !== returnedFamily) {
+    checks.push(warn("identity", "Catalog model provenance", `The catalog owner (${ownedBy}, ${ownerFamily}) does not match the returned model (${returnedModel}, ${returnedFamily}). Aggregators can make this legitimate, so the signal is weak.`, 5, 2));
+  }
+
   if (firstCompletion) {
     checks.push(firstCompletion?.choices?.[0]?.message
       ? pass("capability", "Chat completion", "The endpoint returned a valid chat-completion message.", 15)
@@ -574,62 +598,122 @@ async function runModelVerification({ base, apiKey, modelId, advertisedIds = [],
 
   checks.push(assessUsageConsistency(runs));
 
+  let tokensUsed = BASELINE_RUNS * 24;
+  const withinBudget = (cost) => {
+    if (tokensUsed + cost > tokenBudget) return false;
+    tokensUsed += cost;
+    return true;
+  };
+  const budgetSkipped = (title) => info("capability", title, "Skipped so the run stays within its token budget.");
+
+  if (firstCompletion && expected.likelyChat) {
+    if (!withinBudget(16)) {
+      checks.push(budgetSkipped("Known answer"));
+    } else {
+      try {
+        const data = await chatJsonRequest({
+          base,
+          apiKey,
+          payload: {
+            model: modelId,
+            temperature: 0,
+            max_tokens: 16,
+            messages: [
+              { role: "system", content: "Reply with only the number." },
+              { role: "user", content: "What is 17 plus 25?" },
+            ],
+          },
+        });
+        const answer = firstUsefulNumber(textFromCompletion(data));
+        checks.push(answer === 42
+          ? pass("capability", "Known answer", "The model returned the correct answer to a simple arithmetic probe.", 5)
+          : warn("capability", "Known answer", "The model did not return the expected answer to a simple arithmetic probe.", 5, 2));
+      } catch (error) {
+        checks.push(info("capability", "Known answer", `The known-answer probe was inconclusive: ${errorDetail(error, apiKey)}`));
+      }
+    }
+  }
+
   if (firstCompletion) {
-    try {
-      const data = await chatJsonRequest({
-        base,
-        apiKey,
-        payload: {
-          model: modelId,
-          temperature: 0,
-          max_tokens: 120,
-          messages: [
-            { role: "system", content: "Return only valid JSON. Do not use markdown fences." },
-            { role: "user", content: 'Return exactly this JSON shape with the value "ok": {"ok":true,"verifier":"model-endpoint-verifier"}' },
-          ],
-          response_format: { type: "json_object" },
-        },
-      });
-      const json = parseJsonText(textFromCompletion(data));
-      checks.push(json?.ok === true && json?.verifier === "model-endpoint-verifier"
-        ? pass("capability", "Structured output", "The model returned the requested JSON object.", 20)
-        : warn("capability", "Structured output", "The endpoint accepted the JSON-mode request but did not return the requested object.", 20, 5));
-    } catch (error) {
-      checks.push(warn("capability", "Structured output", `The structured-output probe was inconclusive: ${errorDetail(error, apiKey)}`, 20));
+    if (!withinBudget(120)) {
+      checks.push(budgetSkipped("Structured output"));
+    } else {
+      try {
+        const data = await chatJsonRequest({
+          base,
+          apiKey,
+          payload: {
+            model: modelId,
+            temperature: 0,
+            max_tokens: 120,
+            messages: [
+              { role: "system", content: "Return only valid JSON. Do not use markdown fences." },
+              { role: "user", content: 'Return exactly this JSON shape with the value "ok": {"ok":true,"verifier":"model-endpoint-verifier"}' },
+            ],
+            response_format: { type: "json_object" },
+          },
+        });
+        const json = parseJsonText(textFromCompletion(data));
+        checks.push(json?.ok === true && json?.verifier === "model-endpoint-verifier"
+          ? pass("capability", "Structured output", "The model returned the requested JSON object.", 20)
+          : warn("capability", "Structured output", "The endpoint accepted the JSON-mode request but did not return the requested object.", 20, 5));
+      } catch (error) {
+        const fp = errorFingerprint(error);
+        const detail = fp === "unsupported_parameter"
+          ? `The endpoint rejected the JSON-mode request: ${errorDetail(error, apiKey)}`
+          : fp === "rate_limit" || fp === "quota" || fp === "auth"
+            ? `The structured-output probe could not be assessed (${fp}): ${errorDetail(error, apiKey)}`
+            : `The structured-output probe was inconclusive: ${errorDetail(error, apiKey)}`;
+        checks.push(warn("capability", "Structured output", detail, 20));
+      }
     }
   }
 
   if (firstCompletion && expected.likelyTools) {
-    try {
-      const toolCall = await chatJsonRequest({
-        base,
-        apiKey,
-        payload: {
-          model: modelId,
-          temperature: 0,
-          max_tokens: 80,
-          messages: [{ role: "user", content: "Use the available tool to look up the weather in London." }],
-          tools: [{ type: "function", function: { name: "get_weather", description: "Get current weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }],
-          tool_choice: { type: "function", function: { name: "get_weather" } },
-        },
-      });
-      const calls = toolCall?.choices?.[0]?.message?.tool_calls;
-      checks.push(Array.isArray(calls) && calls.length > 0
-        ? pass("capability", "Tool calling", "The model produced a tool-call envelope matching the API format.", 15)
-        : warn("capability", "Tool calling", "The endpoint accepted the tool request but did not emit a tool call.", 15, 5));
-    } catch (error) {
-      checks.push(warn("capability", "Tool calling", `The advertised chat model did not pass the tool-call probe: ${errorDetail(error, apiKey)}`, 15));
+    if (!withinBudget(80)) {
+      checks.push(budgetSkipped("Tool calling"));
+    } else {
+      try {
+        const toolCall = await chatJsonRequest({
+          base,
+          apiKey,
+          payload: {
+            model: modelId,
+            temperature: 0,
+            max_tokens: 80,
+            messages: [{ role: "user", content: "Use the available tool to look up the weather in London." }],
+            tools: [{ type: "function", function: { name: "get_weather", description: "Get current weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }],
+            tool_choice: { type: "function", function: { name: "get_weather" } },
+          },
+        });
+        const calls = toolCall?.choices?.[0]?.message?.tool_calls;
+        checks.push(Array.isArray(calls) && calls.length > 0
+          ? pass("capability", "Tool calling", "The model produced a tool-call envelope matching the API format.", 15)
+          : warn("capability", "Tool calling", "The endpoint accepted the tool request but did not emit a tool call.", 15, 5));
+      } catch (error) {
+        const fp = errorFingerprint(error);
+        const detail = fp === "unsupported_parameter"
+          ? `The endpoint rejected the tool-call request: ${errorDetail(error, apiKey)}`
+          : fp === "rate_limit" || fp === "quota" || fp === "auth"
+            ? `The tool-call probe could not be assessed (${fp}): ${errorDetail(error, apiKey)}`
+            : `The advertised chat model did not pass the tool-call probe: ${errorDetail(error, apiKey)}`;
+        checks.push(warn("capability", "Tool calling", detail, 15));
+      }
     }
   }
 
   if (firstCompletion && expected.likelyChat) {
-    try {
-      const stream = await runStreamProbe({ base, apiKey, modelId });
-      checks.push(stream.done && stream.text.length > 0
-        ? pass("capability", "Streaming", `Streamed ${stream.chunks.length} chunks and reached [DONE].`, 10)
-        : warn("capability", "Streaming", "The stream did not complete or produced no text.", 10, 0));
-    } catch (error) {
-      checks.push(warn("capability", "Streaming", `The streaming probe failed: ${errorDetail(error, apiKey)}`, 10));
+    if (!withinBudget(24)) {
+      checks.push(budgetSkipped("Streaming"));
+    } else {
+      try {
+        const stream = await runStreamProbe({ base, apiKey, modelId });
+        checks.push(stream.done && stream.text.length > 0
+          ? pass("capability", "Streaming", `Streamed ${stream.chunks.length} chunks and reached [DONE].`, 10)
+          : warn("capability", "Streaming", "The stream did not complete or produced no text.", 10, 0));
+      } catch (error) {
+        checks.push(warn("capability", "Streaming", `The streaming probe failed: ${errorDetail(error, apiKey)}`, 10));
+      }
     }
   }
 
@@ -757,15 +841,17 @@ async function verify(body) {
   const apiKey = String(body.apiKey || "").trim();
   if (!apiKey) throw new Error("Enter an API key.");
   const requestedModel = String(body.model || "").trim();
+  await assertNotPrivateTarget(base);
   const { models: rawModels, stable } = await discoverCatalog(base, apiKey);
   const models = dedupeById(rawModels);
   if (!models.length) throw new Error("The endpoint responded, but its /models response did not contain any usable model IDs.");
   const availableIds = models.map((model) => model.id);
-  const selected = requestedModel ? [requestedModel] : availableIds.slice(0, 5);
+  const budgeted = requestedModel ? [requestedModel] : availableIds.slice(0, MAX_MODELS_PER_RUN);
+  const tokenBudget = Math.max(1, Math.floor(MAX_PROBE_TOKENS_PER_RUN / Math.max(1, budgeted.length)));
   const catChecks = catalogChecks(rawModels, stable);
-  const reports = await mapWithConcurrency(selected, MODEL_CONCURRENCY, async (modelId) => {
+  const reports = await mapWithConcurrency(budgeted, MODEL_CONCURRENCY, async (modelId) => {
     const catalogEntry = models.find((model) => model.id === modelId);
-    return runModelVerification({ base, apiKey, modelId, advertisedIds: availableIds, catalogEntry, catalogChecks: catChecks });
+    return runModelVerification({ base, apiKey, modelId, advertisedIds: availableIds, catalogEntry, catalogChecks: catChecks, tokenBudget });
   });
   const report = {
     generatedAt: new Date().toISOString(),

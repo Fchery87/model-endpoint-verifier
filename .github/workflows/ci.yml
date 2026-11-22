@@ -23,18 +23,26 @@ jobs:
       - run: npm test
       - run: npm run test:fixtures
 
+  # Nightly live probe. Runs only when the live-endpoint secrets are
+  # configured; every step is skipped (and the job still succeeds) otherwise.
+  # The env context is unavailable in job-level `if`, so each step carries
+  # the guard itself.
   live-probe:
-    # Nightly only, and only when live-endpoint secrets are configured.
-    if: ${{ github.event_name == 'schedule' && env.LIVE_ENDPOINT != '' && env.LIVE_API_KEY != '' }}
+    if: ${{ github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        if: ${{ env.LIVE_ENDPOINT != '' && env.LIVE_API_KEY != '' }}
       - uses: actions/setup-node@v4
+        if: ${{ env.LIVE_ENDPOINT != '' && env.LIVE_API_KEY != '' }}
         with:
           node-version: 20
       - run: node test/record-fixture.mjs
+        if: ${{ env.LIVE_ENDPOINT != '' && env.LIVE_API_KEY != '' }}
       - run: node test/check-fixtures.mjs
+        if: ${{ env.LIVE_ENDPOINT != '' && env.LIVE_API_KEY != '' }}
       - uses: actions/upload-artifact@v4
+        if: ${{ env.LIVE_ENDPOINT != '' && env.LIVE_API_KEY != '' }}
         with:
           name: live-fixture
           path: test/fixtures/
